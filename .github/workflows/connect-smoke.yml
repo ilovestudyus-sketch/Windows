@@ -1,0 +1,115 @@
+name: Windows 安装包连接检查
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-connect-smoke
+  cancel-in-progress: false
+
+jobs:
+  connect:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download the installer package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://github.com/ilovestudyus-sketch/Windows/releases/download/package-0.4.3-test22/ILovestudy-Node-Analyzer-Test-0.4.3-test22.zip'
+          $expected = '595cb5a1c44a97c6b9b2a5a2d9b659ec6e69bd75c0da5749d39506a4b81b09fb'
+          $zip = Join-Path $env:RUNNER_TEMP 'package.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip -TimeoutSec 180
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $expected) { throw 'package hash mismatch' }
+          $dest = Join-Path $env:RUNNER_TEMP 'package'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $cmd = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'Start-Install.cmd' | Select-Object -First 1
+          if (-not $cmd) { throw 'installer entry missing' }
+          "PACKAGE_OK bytes=$((Get-Item -LiteralPath $zip).Length)"
+
+      - name: Connect subscription secret without printing it
+        shell: pwsh
+        env:
+          R9_TEST_SUBSCRIPTIONS: ${{ secrets.R9_TEST_SUBSCRIPTIONS }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $raw = [string]$env:R9_TEST_SUBSCRIPTIONS
+          if ([string]::IsNullOrWhiteSpace($raw)) { throw 'R9_TEST_SUBSCRIPTIONS is empty' }
+          $dir = Join-Path $env:RUNNER_TEMP 'r9-private-input'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $file = Join-Path $dir 'subscriptions.txt'
+          $utf8 = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText($file, $raw, $utf8)
+          $parts = New-Object System.Collections.Generic.List[string]
+          foreach ($line in [System.IO.File]::ReadAllLines($file)) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+            foreach ($part in ([regex]::Split($trimmed, '[\s,，]+'))) {
+              if ($part) { $parts.Add($part) }
+            }
+          }
+          if ($parts.Count -lt 1) { throw 'R9_TEST_SUBSCRIPTIONS has no lines' }
+          foreach ($part in $parts) { Write-Host "::add-mask::$part" }
+          $ok = 0
+          $bad = 0
+          for ($i = 0; $i -lt $parts.Count; $i++) {
+            $out = Join-Path $dir ("sample-{0}.txt" -f ($i + 1))
+            $downloaded = $false
+            try {
+              $uri = [Uri]$parts[$i]
+              if ($uri.Scheme -ne 'https') { throw 'not-https' }
+              Invoke-WebRequest -UseBasicParsing -Uri $parts[$i] -OutFile $out -TimeoutSec 25 -Headers @{ 'User-Agent' = 'v2rayN/7.0' } -MaximumRedirection 5 | Out-Null
+              $len = (Get-Item -LiteralPath $out).Length
+              if ($len -le 0 -or $len -gt 2MB) { throw 'size' }
+              $downloaded = $true
+            } catch {
+              $downloaded = $false
+            }
+            if ($downloaded) {
+              $ok++
+              Write-Host ('{"source":' + ($i + 1) + ',"status":"downloaded"}')
+            } else {
+              $bad++
+              if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+              Write-Host ('{"source":' + ($i + 1) + ',"status":"unavailable"}')
+            }
+          }
+          "SECRET_LINES=$($parts.Count) DOWNLOADED=$ok UNAVAILABLE=$bad"
+          if ($ok -lt 1) { throw 'No subscription source available' }
+
+      - name: Remove private inputs and test files
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ProgressPreference = 'SilentlyContinue'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'r9-private-input'),
+            (Join-Path $env:RUNNER_TEMP 'package'),
+            (Join-Path $env:RUNNER_TEMP 'package.zip'),
+            (Join-Path $env:LOCALAPPDATA 'ILovestudy')
+          )) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          $hostName = 'com.ilovestudy.node_bridge'
+          foreach ($vendor in @('Google\Chrome','Microsoft\Edge')) {
+            foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32,[Microsoft.Win32.RegistryView]::Registry64)) {
+              $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $view)
+              try { $base.DeleteSubKeyTree("Software\$vendor\NativeMessagingHosts\$hostName", $false) } catch {} finally { $base.Dispose() }
+            }
+          }
+          $left = @()
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'r9-private-input'),
+            (Join-Path $env:RUNNER_TEMP 'package'),
+            (Join-Path $env:RUNNER_TEMP 'package.zip'),
+            (Join-Path $env:LOCALAPPDATA 'ILovestudy')
+          )) { if (Test-Path -LiteralPath $path) { $left += 'left' } }
+          if ($left.Count -gt 0) { throw 'cleanup left files behind' }
+          'CLEANED'
